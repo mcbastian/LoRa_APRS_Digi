@@ -12,4 +12,6 @@
   - Admin-Password must be set on first config (User: admin/yourpassword)
  - Longitude/Latitude, Callsign, APRS-IS host, APRS-IS-Port Beacon-Message can be set via Webconf
  - Statuspage with last messages
+ - digipeating works without WiFi (not fully tested, but should work)
+ 
  
