@@ -1,9 +1,10 @@
 #include <map>
+#include <deque>
+#include <IotWebConf.h>
 
 #include <Arduino.h>
 #include <APRS-Decoder.h>
 #include <LoRa_APRS.h>
-#include <WiFiMulti.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <APRS-IS.h>
@@ -17,6 +18,50 @@
 PowerManagement powerManagement;
 #endif
 
+const char thingName[] = "APRSLoRaDigi";
+
+// -- Initial password to connect to the Thing, when it creates an own Access Point.
+const char wifiInitialApPassword[] = "aprsrocks";
+
+#define STRING_LEN 128
+#define NUMBER_LEN 32
+
+// -- Configuration specific key. The value should be modified if config structure was changed.
+#define CONFIG_VERSION "dem2"
+
+
+// -- Callback method declarations.
+void configSaved();
+boolean formValidator();
+
+DNSServer dnsServer;
+WebServer server(80);
+
+char ccall[STRING_LEN];
+char caprsishost[STRING_LEN];
+char caprsisport[NUMBER_LEN];
+char cpasskey[STRING_LEN];
+char cbeaconmessage[STRING_LEN];
+char cbeacontimeout[NUMBER_LEN];
+char cbeaconlat[NUMBER_LEN];
+char cbeaconlon[NUMBER_LEN];
+char cbeaconmsg[STRING_LEN];
+
+#define FORWARD_TIMEOUT 5
+
+IotWebConf iotWebConf(thingName, &dnsServer, &server, wifiInitialApPassword, CONFIG_VERSION);
+IotWebConfParameter callParam = IotWebConfParameter("Callsign", "callParam", ccall, STRING_LEN);
+IotWebConfParameter latParam = IotWebConfParameter("Latitude", "latParam", cbeaconlat, NUMBER_LEN, "number", "e.g. 50.411", NULL, "step='0.00001'");
+IotWebConfParameter lonParam = IotWebConfParameter("Longitude", "lonParam", cbeaconlon, NUMBER_LEN, "number", "e.g. 3.123", NULL, "step='0.00001'");
+IotWebConfSeparator separator1 = IotWebConfSeparator("APRS IS");
+IotWebConfParameter aprsishostParam = IotWebConfParameter("APRS IS Host", "aprsishostParam", caprsishost, STRING_LEN);
+IotWebConfParameter aprsisportParam = IotWebConfParameter("APRS IS Port", "aprsisportParam", caprsisport, NUMBER_LEN, "number", NULL, "14580", NULL);
+IotWebConfParameter passkeyParam = IotWebConfParameter("APRSIS-Passkey", "passkeyParam", cpasskey, STRING_LEN);
+IotWebConfSeparator separator2 = IotWebConfSeparator("Beacon");
+IotWebConfParameter beaconmsgParam = IotWebConfParameter("Beacon Message", "beaconmsgParam", cbeaconmessage, STRING_LEN);
+IotWebConfParameter beacontimeoutParam = IotWebConfParameter("Beacon Timeout", "beacontimeoutParam", cbeacontimeout, NUMBER_LEN, "number", "1..100", "5", "min='1' step='1'");
+// -- We can add a legend to the separator
+
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 hw_timer_t * timer = NULL;
 volatile uint secondsSinceLastTX = 0;
@@ -27,15 +72,30 @@ LoRa_APRS lora_aprs;
 String create_lat_aprs(double lat);
 String create_long_aprs(double lng);
 
-WiFiMulti WiFiMulti;
+// WiFiMulti WiFiMulti;
 String BeaconMsg;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, 60*60);
 APRS_IS * aprs_is = 0;
-
+bool haveWiFi=false;
 void setup_lora();
+void setup_wifi();
+void setup_ntp();
+void setup_aprs_is();
 
-std::map<uint, std::shared_ptr<APRSMessage>> lastMessages;
+std::map<uint, std::shared_ptr<APRSMessage> > lastMessages;
+std::deque<std::pair<String, std::shared_ptr<APRSMessage> > > lastnMessages;
+void configSaved()
+{
+  Serial.println("Configuration was updated.");
+}
+
+void wifiConnected()
+{
+	haveWiFi = true;
+    Serial.println("WiFi was connected.");
+    setup_ntp();
+}
 
 void IRAM_ATTR onTimer()
 {
@@ -49,6 +109,7 @@ void IRAM_ATTR onTimer()
 // cppcheck-suppress unusedFunction
 void setup()
 {
+	
 	Serial.begin(115200);
 
 #if defined(ARDUINO_T_Beam) && !defined(ARDUINO_T_Beam_V0_7)
@@ -67,13 +128,12 @@ void setup()
 	setup_display();
 	
 	delay(500);
-	Serial.println("[INFO] LoRa APRS Digi by OE5BPA (Peter Buchegger)");
-	show_display("OE5BPA", "LoRa APRS Digi", "by Peter Buchegger", 2000);
+	Serial.println("[INFO] LoRa APRS Digi by OE5BPA (Peter Buchegger), WebConf by DB5SB");
+	show_display(ccall, "LoRa APRS Digi", "", 2000);
 
 	setup_wifi();
 	setup_lora();
-	setup_lora();
-	setup_ntp();
+	//setup_lora();
 	setup_aprs_is();
 
 
@@ -83,29 +143,31 @@ void setup()
 	timerAlarmEnable(timer);
 	
 	delay(500);
+	if (strlen(cbeacontimeout)==0) strcpy(cbeacontimeout, "5");
+	if (strlen(ccall)==0) strcpy(ccall, "N0CALL");
 }
 
 // cppcheck-suppress unusedFunction
 void loop()
 {
+	iotWebConf.doLoop();
 	static bool send_update = true;
-
-	if(secondsSinceLastTX >= (BEACON_TIMEOUT*60))
+	if(secondsSinceLastTX >= (atoi(cbeacontimeout)*60))
 	{
 		portENTER_CRITICAL(&timerMux);
-		secondsSinceLastTX -= (BEACON_TIMEOUT*60);
+		secondsSinceLastTX -= (atoi(cbeacontimeout)*60);
 		portEXIT_CRITICAL(&timerMux);
 		send_update = true;
 	}
 
-	if(!aprs_is->connected())
+	if(WiFi.isConnected() && WiFi.getMode() != WIFI_AP && !aprs_is->connected())
 	{
 		Serial.print("[INFO] connecting to server: ");
-		Serial.print(APRSISHOST);
+		Serial.print(caprsishost);
 		Serial.print(" on port: ");
-		Serial.println(APRSISPORT);
+		Serial.println(caprsisport);
 		show_display("INFO", "Connecting to server");
-		if(!aprs_is->connect(APRSISHOST, APRSISPORT))
+		if(!aprs_is->connect(caprsishost, atoi(caprsisport)))
 		{
 			Serial.println("[ERROR] Connection failed.");
 			Serial.println("[INFO] Waiting 5 seconds before retrying...");
@@ -116,29 +178,30 @@ void loop()
 		Serial.println("[INFO] Connected to server!");
 	}
 
-	if(send_update)
+	if(send_update && strcmp(ccall, "N0CALL")!=0)
 	{
 		send_update = false;
 
 		std::shared_ptr<APRSMessage> msg = std::shared_ptr<APRSMessage>(new APRSMessage());
-		msg->setSource(CALL);
+		msg->setSource(ccall);
 		msg->setDestination("APLG0");
-		String lat = create_lat_aprs(BEACON_LAT);
-		String lng = create_long_aprs(BEACON_LNG);
-		msg->getAPRSBody()->setData(String("=") + lat + "R" + lng + "#" + BEACON_MESSAGE);
+		String lat = create_lat_aprs(atof(cbeaconlat));
+		String lng = create_long_aprs(atof(cbeaconlon));
+		msg->getAPRSBody()->setData(String("=") + lat + "R" + lng + "#" + cbeaconmessage);
 		String data = msg->encode();
 		Serial.print(data);
-		show_display(CALL, "<< Beaconing myself >>", data);
+		show_display(ccall, "<< Beaconing myself >>", data);
 		lora_aprs.sendMessage(msg);
-		aprs_is->sendMessage(msg);
+		if (WiFi.isConnected() && WiFi.getMode() != WIFI_AP) aprs_is->sendMessage(msg);
 		Serial.println("finished TXing...");
+		lastnMessages.push_back(std::pair<String, std::shared_ptr<APRSMessage>>(timeClient.getFormattedTime(), msg));
 	}
 
 	if(lora_aprs.hasMessage())
 	{
 		std::shared_ptr<APRSMessage> msg = lora_aprs.getMessage();
 
-		if(msg->getSource().indexOf(CALL) != -1)
+		if(msg->getSource().indexOf(ccall) != -1)
 		{
 			Serial.print("Message already received as repeater: '");
 			Serial.print(msg->toString());
@@ -163,17 +226,22 @@ void loop()
 
 		if(foundMsg == lastMessages.end())
 		{
-			show_display(CALL, "RSSI: " + String(lora_aprs.getMessageRssi()) + ", SNR: " + String(lora_aprs.getMessageSnr()), msg->toString(), 0);
+			show_display(ccall, "RSSI: " + String(lora_aprs.getMessageRssi()) + ", SNR: " + String(lora_aprs.getMessageSnr()), msg->toString(), 0);
 			Serial.print("Received packet '");
 			Serial.print(msg->toString());
 			Serial.print("' with RSSI ");
 			Serial.print(lora_aprs.getMessageRssi());
 			Serial.print(" and SNR ");
 			Serial.println(lora_aprs.getMessageSnr());
-			msg->setPath(String(CALL) + "*");
+			msg->setPath(String(ccall) + "*");
+			Serial.println("Digipeating the Message via HF");
 			lora_aprs.sendMessage(msg);
+			Serial.println("finished TXing...");
+			Serial.println("Digipeating the Message via APRSIS");
 			aprs_is->sendMessage(msg->encode());
+			Serial.println("finished Uploading...");
 			lastMessages.insert({secondsSinceStartup, msg});
+			lastnMessages.push_back(std::pair<String, std::shared_ptr<APRSMessage>>(timeClient.getFormattedTime(), msg));
 		}
 		else
 		{
@@ -198,11 +266,12 @@ void loop()
 			iter++;
 		}
 	}
+	while(lastnMessages.size()>100) { Serial.println("Purging LastNMessages: "+lastnMessages.size()); lastnMessages.pop_front(); }
 
 	static int _secondsSinceLastTX = 0;
 	if(secondsSinceLastTX != _secondsSinceLastTX)
 	{
-		show_display(CALL, "Time to next beaconing: " + String((BEACON_TIMEOUT*60) - secondsSinceLastTX));
+		show_display(ccall, "Time to next beaconing: " + String((atoi(cbeacontimeout)*60) - secondsSinceLastTX));
 	}
 }
 
@@ -250,6 +319,7 @@ String create_long_aprs(double lng)
 
 void setup_ntp()
 {
+	Serial.println("setting up NTP");
 	timeClient.begin();
 	if(!timeClient.forceUpdate())
 	{
@@ -262,34 +332,101 @@ void setup_ntp()
 
 void setup_aprs_is()
 {
-	aprs_is = new APRS_IS(CALL, PASSKEY , "ESP32-APRS-IS", "0.1");
+	Serial.println("setting up APRS-IS");
+	aprs_is = new APRS_IS(ccall, cpasskey , "DB5SB-LoRaDigi", "0.2");
 
 	APRSMessage msg;
-    String lat = create_lat_aprs(BEACON_LAT);
-	String lng = create_long_aprs(BEACON_LNG);
+    String lat = create_lat_aprs(atof(cbeaconlat));
+	String lng = create_long_aprs(atof(cbeaconlon));
 
-	msg.setSource(CALL);
+	msg.setSource(ccall);
 	msg.setDestination("APLG0");
-	msg.getAPRSBody()->setData(String("=") + lat + "I" + lng + "&" + BEACON_MSG);
+	msg.getAPRSBody()->setData(String("=") + lat + "I" + lng + "&" + cbeaconmessage);
 	BeaconMsg = msg.encode();
+}
+void handleRoot()
+{
+	// -- Let IotWebConf test and handle captive portal requests.
+	if (iotWebConf.handleCaptivePortal())
+	{
+		// -- Captive portal request were already served.
+		return;
+	}
+	Serial.println("Sending Homepage");
+	String s = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>";
+	s += "<title>Digi Web Config</title></head><body>";
+	s += "Go to <a href='config'>configure page</a> to change values.";
+	s += "<h3>Last 100 Messages</h3>";
+	s += "<table border=\"1\" cellspacing=\"0\"><thead><tr><th>Time</th><th>Call</th><th>Message</th></tr></thead><tbody>\n";
+	for(std::deque<std::pair<String, std::shared_ptr<APRSMessage>>>::iterator iter = lastnMessages.begin(); iter != lastnMessages.end(); iter++)
+	{
+ 		Serial.println("Adding Row to Table 1");
+		s+= "<tr>\n";
+
+		s+= "<td>";
+		s+= (*iter).first;
+		s+= "</td>";
+
+		s+= "<td>";
+		s+= (*iter).second->getSource();
+		s+= "</td>";
+
+		s+= "<td>";
+		s+= (*iter).second->toString();
+		s+= "</td>";
+
+		s+= "</tr>\n";
+	}
+	s += "</tbody></table>\n";
+	s += "<h3>Last 5 Minutes</h3>";
+	s += "<table border=\"1\" cellspacing=\"0\"><thead><tr><th>Time since startup</th><th>Call</th><th>Message</th></tr></thead><tbody>\n";
+	for(std::map<uint, std::shared_ptr<APRSMessage>>::iterator iter = lastMessages.begin(); iter != lastMessages.end(); iter++)
+	{
+ 		Serial.println("Adding Row to Table 2");
+		s+= "<tr>\n";
+
+		s+= "<td>";
+		s+= iter->first;
+		s+= "</td>";
+
+		s+= "<td>";
+		s+= iter->second->getSource();
+		s+= "</td>";
+
+		s+= "<td>";
+		s+= iter->second->toString();
+		s+= "</td>";
+
+		s+= "</tr>\n";
+	}
+	s += "</tbody></table>\n";
+	s += "</body></html>\n";
+ 	server.send(200, "text/html", s);
+	Serial.println("Homepage sent.");
 }
 
 void setup_wifi()
 {
-	WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
-	WiFi.setHostname(CALL);
-	WiFiMulti.addAP(WIFINAME, WIFIPASS);
+//	WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+//	WiFi.setHostname(CALL);
+//	WiFiMulti.addAP(WIFINAME, WIFIPASS);
 	Serial.print("[INFO] Waiting for WiFi");
 	show_display("INFO", "Waiting for WiFi");
-	while(WiFiMulti.run() != WL_CONNECTED)
-	{
-		Serial.print(".");
-		show_display("INFO", "Waiting for WiFi", "....");
-		delay(500);
-	}
-	Serial.println("");
-	Serial.println("[INFO] WiFi connected");
-	Serial.print("[INFO] IP address: ");
-	Serial.println(WiFi.localIP());
-	show_display("INFO", "WiFi connected", "IP: ", WiFi.localIP().toString(), 2000);
+  iotWebConf.addParameter(&callParam);
+  iotWebConf.addParameter(&latParam);
+  iotWebConf.addParameter(&lonParam);
+  iotWebConf.addParameter(&separator1);
+  iotWebConf.addParameter(&aprsishostParam);
+  iotWebConf.addParameter(&aprsisportParam);
+  iotWebConf.addParameter(&passkeyParam);
+  iotWebConf.addParameter(&separator2);
+  iotWebConf.addParameter(&beaconmsgParam);
+  iotWebConf.addParameter(&beacontimeoutParam);
+  iotWebConf.setWifiConnectionCallback(&wifiConnected);
+  iotWebConf.init();
+	
+  server.on("/", handleRoot);
+  server.on("/config", []{ iotWebConf.handleConfig(); });
+  server.onNotFound([](){ iotWebConf.handleNotFound(); });
+
 }
